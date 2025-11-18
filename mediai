@@ -1,0 +1,295 @@
+!pip install -q gradio transformers torch Pillow pytesseract reportlab accelerate huggingface_hub
+
+# Install Tesseract OCR (for handwriting recognition)
+!apt-get install -q tesseract-ocr
+
+import gradio as gr
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from PIL import Image
+import pytesseract
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+import io
+import re
+from datetime import datetime
+
+# Initialize IBM Granite 3.3 2B Instruct Model
+print("Loading IBM Granite 3.3 2B Instruct Model...")
+model_name = "ibm-granite/granite-3.0-2b-instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto"
+)
+
+print("Model loaded successfully!")
+
+class MEDIAIAssistant:
+    def __init__(self):
+        self.conversation_history = []
+        self.user_symptoms = []
+        self.medication_status = None
+        self.diagnosed_condition = None
+        
+    def generate_response(self, prompt, max_length=512):
+        """Generate response using IBM Granite model"""
+        messages = [
+            {"role": "system", "content": "You are MEDI AI, a helpful medical assistant. Provide clear, compassionate medical guidance in simple language. Always prioritize patient safety and recommend consulting healthcare professionals for serious conditions."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_length,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract only the assistant's response
+        response = response.split("assistant")[-1].strip()
+        return response
+    
+    def extract_text_from_prescription(self, image):
+        """Convert handwritten/printed prescription to text using OCR"""
+        if image is None:
+            return "No image provided", None
+        
+        try:
+            # Perform OCR
+            text = pytesseract.image_to_string(image)
+            
+            if not text.strip():
+                return "Could not extract text from image. Please ensure the image is clear.", None
+            
+            # Generate PDF
+            pdf_buffer = io.BytesIO()
+            c = canvas.Canvas(pdf_buffer, pagesize=letter)
+            
+            # Add title
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(1*inch, 10*inch, "MEDI AI - Prescription Extract")
+            
+            # Add date
+            c.setFont("Helvetica", 10)
+            c.drawString(1*inch, 9.5*inch, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # Add extracted text
+            c.setFont("Helvetica", 12)
+            text_object = c.beginText(1*inch, 9*inch)
+            text_object.setFont("Helvetica", 11)
+            
+            # Split text into lines and add to PDF
+            lines = text.split('\n')
+            for line in lines[:40]:  # Limit to 40 lines
+                text_object.textLine(line[:80])  # Limit line length
+            
+            c.drawText(text_object)
+            c.save()
+            
+            pdf_buffer.seek(0)
+            
+            return text, pdf_buffer.getvalue()
+        
+        except Exception as e:
+            return f"Error processing image: {str(e)}", None
+    
+    def analyze_symptoms_and_suggest(self, symptoms, age, current_medication):
+        """Analyze symptoms and provide diagnosis with treatment suggestions"""
+        
+        prompt = f"""As a medical AI assistant, analyze the following patient information and provide:
+
+Patient Age: {age} years
+Current Symptoms: {symptoms}
+Currently on Medication: {current_medication}
+
+Please provide:
+1. A simple explanation of the likely health condition in easy-to-understand language
+2. Recommended medicines with age-appropriate dosages
+3. Natural remedies and lifestyle suggestions
+4. Important precautions
+5. When to seek immediate medical attention
+
+Keep the explanation simple and compassionate."""
+
+        response = self.generate_response(prompt, max_length=700)
+        return response
+    
+    def chatbot_response(self, message, history):
+        """Main chatbot interface"""
+        if not message.strip():
+            return history + [[message, "Please provide your symptoms or questions."]]
+        
+        # Generate response
+        response = self.generate_response(message, max_length=400)
+        
+        # Add helpful prompts
+        if any(word in message.lower() for word in ['pain', 'fever', 'cough', 'headache', 'symptom']):
+            response += "\n\n📋 Would you like me to analyze your symptoms in detail? Please share your age and any current medications you're taking."
+        
+        return history + [[message, response]]
+
+# Initialize assistant
+assistant = MEDIAIAssistant()
+
+def process_prescription(image):
+    """Process prescription image"""
+    text, pdf_bytes = assistant.extract_text_from_prescription(image)
+    
+    if pdf_bytes:
+        # Save PDF temporarily
+        with open("/tmp/prescription.pdf", "wb") as f:
+            f.write(pdf_bytes)
+        return text, "/tmp/prescription.pdf"
+    return text, None
+
+def analyze_symptoms(symptoms, age, medication_status):
+    """Analyze symptoms and provide recommendations"""
+    if not symptoms.strip():
+        return "Please provide your symptoms for analysis."
+    
+    if not age or age < 1 or age > 120:
+        return "Please provide a valid age (1-120 years)."
+    
+    analysis = assistant.analyze_symptoms_and_suggest(symptoms, age, medication_status)
+    
+    # Add follow-up message
+    follow_up = f"""
+
+{'='*60}
+🏥 MEDI AI - Follow-up Care Instructions
+{'='*60}
+
+✅ Take care of yourself
+✅ Take medicines on time as prescribed
+✅ Stay hydrated and get adequate rest
+✅ Monitor your symptoms
+
+⚠️ If you don't feel better after following this advice for 2-3 days, 
+please get back to MEDI AI or consult a healthcare professional immediately.
+
+🔔 For emergencies, please contact your nearest hospital or emergency services.
+
+Remember: This is AI-generated advice. For serious conditions, always consult a qualified healthcare professional.
+
+{'='*60}
+Stay healthy! 💚
+"""
+    
+    return analysis + follow_up
+
+# Create Gradio Interface
+with gr.Blocks(title="MEDI AI - Your Healthcare Assistant", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🏥 MEDI AI - Your Personal Healthcare Assistant
+    ### Powered by IBM Granite 3.3 2B Instruct | Built with ❤️ for Better Healthcare
+    """)
+    
+    with gr.Tabs():
+        # Tab 1: Chatbot
+        with gr.Tab("💬 Chat with MEDI AI"):
+            gr.Markdown("### Talk to MEDI AI about your health concerns")
+            chatbot = gr.Chatbot(height=400, label="MEDI AI Conversation")
+            msg = gr.Textbox(
+                label="Your Message",
+                placeholder="Describe your symptoms or ask health-related questions...",
+                lines=2
+            )
+            send_btn = gr.Button("Send Message", variant="primary")
+            clear = gr.Button("Clear Chat")
+            
+            send_btn.click(assistant.chatbot_response, [msg, chatbot], chatbot)
+            msg.submit(assistant.chatbot_response, [msg, chatbot], chatbot)
+            clear.click(lambda: None, None, chatbot, queue=False)
+        
+        # Tab 2: Prescription Scanner
+        with gr.Tab("📄 Prescription Scanner"):
+            gr.Markdown("### Upload your handwritten or printed prescription")
+            gr.Markdown("*MEDI AI will convert it to text and PDF format*")
+            
+            with gr.Row():
+                with gr.Column():
+                    prescription_image = gr.Image(
+                        label="Upload Prescription Image",
+                        type="pil"
+                    )
+                    scan_btn = gr.Button("🔍 Scan Prescription", variant="primary")
+                
+                with gr.Column():
+                    extracted_text = gr.Textbox(
+                        label="Extracted Text",
+                        lines=15,
+                        placeholder="Extracted prescription text will appear here..."
+                    )
+                    pdf_output = gr.File(label="Download PDF")
+            
+            scan_btn.click(
+                process_prescription,
+                inputs=[prescription_image],
+                outputs=[extracted_text, pdf_output]
+            )
+        
+        # Tab 3: Symptom Analyzer
+        with gr.Tab("🔬 Symptom Analyzer & Treatment Advisor"):
+            gr.Markdown("### Get personalized health analysis and treatment suggestions")
+            
+            with gr.Row():
+                with gr.Column():
+                    symptoms_input = gr.Textbox(
+                        label="Describe Your Symptoms",
+                        placeholder="E.g., I have a headache, fever of 101°F, and body ache for 2 days...",
+                        lines=4
+                    )
+                    age_input = gr.Number(
+                        label="Your Age",
+                        value=30,
+                        minimum=1,
+                        maximum=120
+                    )
+                    medication_input = gr.Radio(
+                        label="Are you currently on any medication?",
+                        choices=["No", "Yes - Please specify in symptoms"],
+                        value="No"
+                    )
+                    analyze_btn = gr.Button("🔍 Analyze & Get Recommendations", variant="primary")
+                
+                with gr.Column():
+                    analysis_output = gr.Textbox(
+                        label="MEDI AI Analysis & Recommendations",
+                        lines=20,
+                        placeholder="Your personalized health analysis will appear here..."
+                    )
+            
+            analyze_btn.click(
+                analyze_symptoms,
+                inputs=[symptoms_input, age_input, medication_input],
+                outputs=[analysis_output]
+            )
+    
+    # Footer
+    gr.Markdown("""
+    ---
+    ### ⚠️ Important Disclaimer
+    MEDI AI is an AI-powered assistant designed to provide general health information and guidance. 
+    This tool is **NOT a substitute for professional medical advice, diagnosis, or treatment**. 
+    Always consult qualified healthcare professionals for medical concerns.
+    
+    **Emergency**: For medical emergencies, call your local emergency services immediately.
+    
+    ---
+    💚 Take care | ⏰ Take medicines on time | 🏥 Consult doctors when needed
+    """)
+
+# Launch the application
+demo.queue()
+demo.launch(share=True, debug=True)
